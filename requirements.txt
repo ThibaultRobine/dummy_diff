@@ -1,0 +1,6 @@
+torch>=1.13.1
+torchvision>=0.13
+scikit-learn
+opencv-python
+libmr
+git+https://github.com/Jingkang50/OpenOOD  # Install OpenOOD via pip
