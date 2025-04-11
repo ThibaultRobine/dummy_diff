@@ -101,7 +101,7 @@ def main():
     full_results = pd.concat([custom_metrics, base_metrics],
                              keys=['Custom', 'Base']
     ).reset_index(level=1).rename(columns={'level_1': 'Dataset'})
-    full_results.to_csv('full_ood_results.csv')
+    full_results.to_csv('ood_results.csv')
     print(full_results)
 
 if __name__ == '__main__':
