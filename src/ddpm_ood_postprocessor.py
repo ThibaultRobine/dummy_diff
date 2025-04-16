@@ -1,4 +1,4 @@
-# src/diffusion_postprocessor.py
+# ddpm_ood_postprocessor.py (your existing file)
 
 from typing import Any
 import torch
@@ -7,26 +7,23 @@ from openood.postprocessors import BasePostprocessor
 import improved_diffusion.dist_util as dist_util
 from improved_diffusion.train_util import TrainLoop
 from improved_diffusion.resample import create_named_schedule_sampler
-from algorithm import kmeans_x_ref_list, optimize_reference_point, gaussianQuadrature, train_kde
 from custom_wrapper import create_custom_model_and_diffusion
 from diffusion_model_manager import get_trained_diffusion_model, set_trained_diffusion_model
+from algorithm import ddpm_ood_reconstruct_1d  
 
 
-class DiffusionPostprocessor(BasePostprocessor):
+class DdpmOODPostprocessor(BasePostprocessor):
     def __init__(self, config):
         super().__init__(config)
         post_cfg = config.get('postprocessor', {})
         self.APS_mode = post_cfg.get('APS_mode', False)
         self.diffusion_args = post_cfg.get('diffusion_args', {})
-        self.integration_args = post_cfg.get('integration_method', {})
+        self.ddpmood_args = post_cfg.get('ddpmood_args', {})
 
         self.setup_flag = False
         self.diffusion_model = None
         self.diffusion_obj = None
         self.train_loop = None
-        self.x_ref = None
-        self.kde = None
-        self.scaler = None
         self.config = config
 
     def setup(self, net, id_loader_dict, ood_loader_dict):
@@ -132,63 +129,6 @@ class DiffusionPostprocessor(BasePostprocessor):
             model.eval()
             set_trained_diffusion_model(model, diffusion)
 
-        feats_list = []
-        for batch_data in id_loader_dict['train']:
-            with torch.no_grad():
-                imgs = batch_data['data'].cuda()
-                _, feats_b = net(imgs, return_feature=True)
-                feats_list.append(feats_b.cpu())
-        all_id_features = torch.cat(feats_list, dim=0).to('cuda')
-
-
-        kmeans_k = self.integration_args['kmeans_k']
-        asc_steps = self.integration_args['asc_steps']
-        asc_lr = self.integration_args['asc_lr']
-        asc_grad_clip = self.integration_args['asc_grad_clip']
-        asc_wd = self.integration_args['asc_wd']
-        asc_device = self.integration_args['device']
-        gauss_n = self.integration_args['gauss_n']
-        gauss_batch = self.integration_args['gauss_batch']
-
-        asc_lr_scheduler = self.integration_args['asc_lr_scheduler']            # e.g. None or ("exponential", {...})
-        asc_conv_window = self.integration_args['asc_convergence_window']       # e.g. 2000
-        asc_conv_thresh = self.integration_args['asc_convergence_threshold']    # e.g. 1e-6
-        asc_min_steps = self.integration_args['asc_min_steps']                  # e.g. 100
-
-        init_refs = kmeans_x_ref_list(all_id_features, kmeans_k)
-        ref_points = optimize_reference_point(
-            model=self.diffusion_model,
-            initial_x=init_refs,
-            num_steps=asc_steps,
-            lr=asc_lr,
-            max_grad_norm=asc_grad_clip,
-            weight_decay=asc_wd,
-            lr_scheduler=asc_lr_scheduler,
-            convergence_window=asc_conv_window,
-            convergence_threshold=asc_conv_thresh,
-            min_steps=asc_min_steps,
-            device=asc_device
-        )
-        self.x_ref = ref_points.to(asc_device)
-
-        scores_list = []
-        with torch.no_grad():
-            for x_ref in ref_points:
-                sc = gaussianQuadrature(
-                    model=self.diffusion_model,
-                    x=all_id_features,
-                    x_ref=x_ref,
-                    n=gauss_n,
-                    device=asc_device,
-                    batch_size=gauss_batch
-                )
-                scores_list.append(sc.unsqueeze(1))
-        id_scores = torch.cat(scores_list, dim=1)
-
-        kde, scaler = train_kde(id_scores)
-        self.kde = kde
-        self.scaler = scaler
-
     @torch.no_grad()
     def postprocess(self, net: torch.nn.Module, data: Any):
         logits = net(data)
@@ -196,27 +136,13 @@ class DiffusionPostprocessor(BasePostprocessor):
 
         _, feats = net(data, return_feature=True)
 
-        int_cfg = self.diffusion_args['integration_method']
-        gauss_n = int_cfg['gauss_n']
-        gauss_batch = int_cfg['gauss_batch']
-        asc_device = int_cfg['device']
+        recon, mse_list = ddpm_ood_reconstruct_1d(
+            feats, self.diffusion_model, self.diffusion_obj,
+            self.ddpmood_args.get('ood_t'),
+            self.ddpmood_args.get('num_inference_steps'),
+        )
 
-        all_scores_list = []
-        for x_ref in self.x_ref:
-            sc = gaussianQuadrature(
-                model=self.diffusion_model,
-                x=feats,
-                x_ref=x_ref,
-                n=gauss_n,
-                device=asc_device,
-                batch_size=gauss_batch
-            )
-            all_scores_list.append(sc.unsqueeze(1))
-
-        all_scores = torch.cat(all_scores_list, dim=1).cpu().numpy()
-        scaled_scores = self.scaler.transform(all_scores)
-        kde_scores = -self.kde.score_samples(scaled_scores)
-        ood_score = torch.from_numpy(kde_scores).to(logits.device)
+        ood_score = torch.tensor(mse_list, device=feats.device, dtype=torch.float)
 
         return pred, ood_score
 
@@ -228,3 +154,4 @@ class DiffusionPostprocessor(BasePostprocessor):
                     _, feats = net(images, return_feature=True)
                     feats = feats.unsqueeze(1)
                 yield feats, {}
+

@@ -41,16 +41,13 @@ def optimize_reference_point(
                 active_x = x[active_mask]
                 if active_x.numel() == 0:
                     break
-                # Reshape [B, D] -> [B, 1, D] for 1D UNet
                 active_x_reshaped = active_x.unsqueeze(1)
                 score_reshaped = model(active_x_reshaped, torch.zeros(active_x.size(0), dtype=torch.long, device=device))
-                # Now squeeze(1) back to [B, D] so .norm(dim=1) works
                 score = score_reshaped.squeeze(1)
                 score_history[step, active_mask] = score.norm(dim=1)
 
             x.grad = torch.zeros_like(x)
-            # Reuse score_reshaped (i.e. shape [B,1,D]) if needed, but we'll just do
-            x.grad[active_mask] = -score  # shape [B, D]
+            x.grad[active_mask] = -score  
             if max_grad_norm is not None:
                 torch.nn.utils.clip_grad_norm_([x], max_grad_norm)
             optimizer.step()
@@ -80,10 +77,8 @@ def projected_score(model, t, x, y, device='cuda'):
         z = x * (1 - t) + y * t
         shape = z.shape
         z = z.reshape(-1, z.shape[-1])
-        # Reshape to [B,1,D] for model
         z_reshaped = z.unsqueeze(1)
         s_reshaped = model(z_reshaped, torch.zeros(z_reshaped.size(0), dtype=torch.long, device=device))
-        # Squeeze back to [B,D]
         s = s_reshaped.squeeze(1)
         s = s.view(shape)
         return torch.sum(s * (y - x), dim=1)
@@ -141,3 +136,137 @@ def train_kde(id_scores):
     kde = grid.best_estimator_
     kde.fit(scaler.transform(id_scores_np))
     return kde, scaler
+
+def compute_diffpath_stats(model, diffusion, data, n_steps=20, batch_size=512, device='cuda'):
+    """Batch-processed statistics computation without DataLoader"""
+    model.eval()
+    stats = []
+    alpha_bars = diffusion.sqrt_alphas_cumprod ** 2
+
+    for i in tqdm(range(0, len(data), batch_size),
+                    desc="Processing Batches",
+                    unit="batch"):
+        batch = data[i:i+batch_size].to(device)
+        epsilons = []
+        xt = batch.clone()
+
+        # Forward DDIM process
+        timesteps = np.linspace(0, diffusion.num_timesteps-1, n_steps, dtype=int)[::-1]
+        for t in timesteps:
+            t_tensor = torch.full((xt.shape[0],), t, device=device)
+            eps_pred = model(xt.unsqueeze(1), t_tensor).clamp(-1e3, 1e3).squeeze(1)
+            epsilons.append(eps_pred.cpu())
+
+            # Update xt
+            alpha_bar_t = alpha_bars[t]
+            alpha_bar_prev = alpha_bars[t-1] if t > 0 else 1.0
+            xt = torch.sqrt(torch.tensor(alpha_bar_prev)) * (
+                xt - torch.sqrt(torch.tensor(1 - alpha_bar_t)) * eps_pred
+            ) / torch.sqrt(torch.tensor(alpha_bar_t))
+
+        # Compute statistics
+        eps = torch.stack(epsilons).numpy()
+        eps_sum = eps.sum((0,2))
+        eps_sq = (eps**2).sum((0,2))
+        eps_cb = (eps**3).sum((0,2))
+
+        eps_diff = np.diff(eps, axis=0) * diffusion.num_timesteps
+        deps_sum = eps_diff.sum((0,2))
+        deps_sq = (eps_diff**2).sum((0,2))
+        deps_cb = (eps_diff**3).sum((0,2))
+
+        stats.append(np.vstack([eps_sum, eps_sq, eps_cb, deps_sum, deps_sq, deps_cb]).T)
+
+    return np.concatenate(stats)
+
+
+def compute_msma_stats(model, diffusion, data, n_steps=20, batch_size=1024, device='cuda'):
+    """Memory-optimized MSMA statistics computation"""
+    model.eval()
+    stats = []
+    alpha_bars = (diffusion.sqrt_alphas_cumprod ** 2)
+    
+    with torch.no_grad():
+        for i in tqdm(range(0, len(data), batch_size),
+                     desc="MSMA Stats"):
+            batch = data[i:i+batch_size].to(device)
+            l2_norms = []
+            xt = batch.clone()
+
+            timesteps = np.linspace(0, diffusion.num_timesteps-1, n_steps, dtype=int)[::-1]
+            
+            for t in timesteps:
+                t_tensor = torch.full((xt.shape[0],), t, device=device)
+                
+                eps_pred = model(xt.unsqueeze(1), t_tensor).squeeze(1)
+                
+                l2_norms.append(torch.linalg.norm(eps_pred, dim=1).cpu())
+                
+                alpha_bar_t = alpha_bars[t]
+                alpha_bar_prev = alpha_bars[t-1] if t > 0 else 1.0
+                xt = (
+                    torch.sqrt(torch.tensor(alpha_bar_prev, device=device)) *
+                    (xt - torch.sqrt(torch.tensor(1 - alpha_bar_t, device=device)) * eps_pred)
+                ) / torch.sqrt(torch.tensor(alpha_bar_t, device=device))
+            
+            # Stack norms across timesteps
+            stats.append(torch.stack(l2_norms, dim=1).numpy())
+
+    return np.concatenate(stats)
+
+# algorithm.py (new file)
+
+import torch
+import numpy as np
+
+import torch
+import numpy as np
+
+def ddpm_ood_reconstruct_1d(feats, diffusion_model, diffusion_obj, t, num_inference_steps):
+    device = feats.device
+    B = feats.shape[0]
+    if feats.dim() == 2:
+        feats = feats.unsqueeze(1)
+
+    betas = torch.tensor(diffusion_obj.betas, device=device, dtype=torch.float32)
+    alphas_cum = torch.tensor(diffusion_obj.alphas_cumprod, device=device, dtype=torch.float32)
+    T = betas.shape[0]
+    t = min(t, T - 1)
+
+    alpha_t = alphas_cum[t]
+    sqrt_alpha_cum = torch.sqrt(alpha_t)
+    sqrt_one_minus_alpha_cum = torch.sqrt(1.0 - alpha_t)
+
+    noise = torch.randn_like(feats)
+    x_t = sqrt_alpha_cum * feats + sqrt_one_minus_alpha_cum * noise
+
+    step_list = torch.linspace(t, 0, num_inference_steps, dtype=torch.long, device=device).unique_consecutive()
+    recon = x_t.clone()
+
+    for i in range(len(step_list) - 1):
+        curr_t = int(step_list[i].item())
+        t_tensor = torch.full((B,), curr_t, device=device, dtype=torch.long)
+        eps = diffusion_model(recon, t_tensor)
+        alpha_cum_curr = alphas_cum[curr_t]
+        x0_pred = (recon - torch.sqrt(1.0 - alpha_cum_curr) * eps) / torch.sqrt(alpha_cum_curr)
+        next_t = int(step_list[i+1].item())
+        alpha_cum_next = alphas_cum[next_t]
+        recon = torch.sqrt(alpha_cum_next) * x0_pred + torch.sqrt(1.0 - alpha_cum_next) * eps
+
+    mse_list = []
+    if recon.dim() == 3 and recon.shape[1] == 1:
+        feats_2d = feats.squeeze(1)
+        recon_2d = recon.squeeze(1)
+    else:
+        feats_2d = feats
+        recon_2d = recon
+
+    feats_np = feats_2d.cpu().numpy()
+    recon_np = recon_2d.cpu().numpy()
+
+    for b in range(B):
+        val = np.mean((feats_np[b] - recon_np[b])**2)
+        mse_list.append(val)
+
+    return recon, mse_list
+

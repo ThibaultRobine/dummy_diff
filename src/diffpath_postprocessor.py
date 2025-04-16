@@ -1,33 +1,31 @@
-# src/diffusion_postprocessor.py
+# src/new_diffusion_postprocessor.py
 
 from typing import Any
 import torch
+import numpy as np
 from openood.postprocessors import BasePostprocessor
-
 import improved_diffusion.dist_util as dist_util
 from improved_diffusion.train_util import TrainLoop
 from improved_diffusion.resample import create_named_schedule_sampler
-from algorithm import kmeans_x_ref_list, optimize_reference_point, gaussianQuadrature, train_kde
 from custom_wrapper import create_custom_model_and_diffusion
 from diffusion_model_manager import get_trained_diffusion_model, set_trained_diffusion_model
+from algorithm import compute_diffpath_stats, train_kde
 
-
-class DiffusionPostprocessor(BasePostprocessor):
+class DiffPathPostprocessor(BasePostprocessor):
     def __init__(self, config):
         super().__init__(config)
+        self.config = config
         post_cfg = config.get('postprocessor', {})
         self.APS_mode = post_cfg.get('APS_mode', False)
         self.diffusion_args = post_cfg.get('diffusion_args', {})
-        self.integration_args = post_cfg.get('integration_method', {})
+        self.diffpath_args = post_cfg.get('diffpath_args', {})
 
         self.setup_flag = False
         self.diffusion_model = None
         self.diffusion_obj = None
-        self.train_loop = None
-        self.x_ref = None
         self.kde = None
         self.scaler = None
-        self.config = config
+        self.id_diffpath_stats = None
 
     def setup(self, net, id_loader_dict, ood_loader_dict):
         if self.setup_flag:
@@ -131,95 +129,51 @@ class DiffusionPostprocessor(BasePostprocessor):
             self.train_loop.run_loop()
             model.eval()
             set_trained_diffusion_model(model, diffusion)
-
-        feats_list = []
+        
+        stats_list = []
         for batch_data in id_loader_dict['train']:
             with torch.no_grad():
                 imgs = batch_data['data'].cuda()
                 _, feats_b = net(imgs, return_feature=True)
-                feats_list.append(feats_b.cpu())
-        all_id_features = torch.cat(feats_list, dim=0).to('cuda')
-
-
-        kmeans_k = self.integration_args['kmeans_k']
-        asc_steps = self.integration_args['asc_steps']
-        asc_lr = self.integration_args['asc_lr']
-        asc_grad_clip = self.integration_args['asc_grad_clip']
-        asc_wd = self.integration_args['asc_wd']
-        asc_device = self.integration_args['device']
-        gauss_n = self.integration_args['gauss_n']
-        gauss_batch = self.integration_args['gauss_batch']
-
-        asc_lr_scheduler = self.integration_args['asc_lr_scheduler']            # e.g. None or ("exponential", {...})
-        asc_conv_window = self.integration_args['asc_convergence_window']       # e.g. 2000
-        asc_conv_thresh = self.integration_args['asc_convergence_threshold']    # e.g. 1e-6
-        asc_min_steps = self.integration_args['asc_min_steps']                  # e.g. 100
-
-        init_refs = kmeans_x_ref_list(all_id_features, kmeans_k)
-        ref_points = optimize_reference_point(
-            model=self.diffusion_model,
-            initial_x=init_refs,
-            num_steps=asc_steps,
-            lr=asc_lr,
-            max_grad_norm=asc_grad_clip,
-            weight_decay=asc_wd,
-            lr_scheduler=asc_lr_scheduler,
-            convergence_window=asc_conv_window,
-            convergence_threshold=asc_conv_thresh,
-            min_steps=asc_min_steps,
-            device=asc_device
-        )
-        self.x_ref = ref_points.to(asc_device)
-
-        scores_list = []
-        with torch.no_grad():
-            for x_ref in ref_points:
-                sc = gaussianQuadrature(
+                stats = compute_diffpath_stats(
                     model=self.diffusion_model,
-                    x=all_id_features,
-                    x_ref=x_ref,
-                    n=gauss_n,
-                    device=asc_device,
-                    batch_size=gauss_batch
+                    diffusion=self.diffusion_obj,
+                    data=feats_b,
+                    n_steps=self.diffpath_args.get('n_steps'),
+                    batch_size=self.diffpath_args.get('batch_size'),
+                    device=self.diffpath_args.get('device', 'cuda')
                 )
-                scores_list.append(sc.unsqueeze(1))
-        id_scores = torch.cat(scores_list, dim=1)
+                stats_list.append(torch.from_numpy(stats))
+        stats = torch.cat(stats_list, dim=0)
+        self.id_diffpath_stats = stats
 
-        kde, scaler = train_kde(id_scores)
-        self.kde = kde
-        self.scaler = scaler
+        # Fit the KDE on the ID diffpath stats
+        self.kde, self.scaler = train_kde(stats)
 
     @torch.no_grad()
     def postprocess(self, net: torch.nn.Module, data: Any):
+        # Get classifier predictions
         logits = net(data)
         pred = logits.argmax(dim=1)
 
+        # Get features
         _, feats = net(data, return_feature=True)
 
-        int_cfg = self.diffusion_args['integration_method']
-        gauss_n = int_cfg['gauss_n']
-        gauss_batch = int_cfg['gauss_batch']
-        asc_device = int_cfg['device']
-
-        all_scores_list = []
-        for x_ref in self.x_ref:
-            sc = gaussianQuadrature(
-                model=self.diffusion_model,
-                x=feats,
-                x_ref=x_ref,
-                n=gauss_n,
-                device=asc_device,
-                batch_size=gauss_batch
-            )
-            all_scores_list.append(sc.unsqueeze(1))
-
-        all_scores = torch.cat(all_scores_list, dim=1).cpu().numpy()
-        scaled_scores = self.scaler.transform(all_scores)
-        kde_scores = -self.kde.score_samples(scaled_scores)
-        ood_score = torch.from_numpy(kde_scores).to(logits.device)
-
-        return pred, ood_score
-
+        # Compute diffpath statistics for this batch
+        stats = compute_diffpath_stats(
+            model=self.diffusion_model,
+            diffusion=self.diffusion_obj,
+            data=feats,
+            n_steps=self.diffpath_args.get('n_steps'),
+            batch_size=self.diffpath_args.get('batch_size'),
+            device=self.diffpath_args.get('device', 'cuda')
+        )
+        stats = torch.from_numpy(stats)
+        # Score with KDE
+        scaled_stats = self.scaler.transform(stats)
+        kde_scores = -self.kde.score_samples(scaled_stats)
+        return pred, torch.from_numpy(kde_scores)
+    
     def _make_feature_generator(self, net, loader):
         while True:
             for batch_data in loader:
