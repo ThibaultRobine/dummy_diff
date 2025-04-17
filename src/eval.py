@@ -105,8 +105,11 @@ def main():
     custom_metrics = custom_evaluator.eval_ood(fsood=False)
     print('OURS metrics:')
     print(custom_metrics)
+    results_df = pd.DataFrame(custom_metrics)
+    results_df.to_csv('ood_results.csv', index=False)
+    print("Results saved to ood_results.csv")
 
-    ddpm_ood_postprocessor = DdpmOODPostprocessor(config)
+"""     ddpm_ood_postprocessor = DdpmOODPostprocessor(config)
     print("Running DDPM evaluation...")
     ddpm_evaluator = Evaluator(
         net,
@@ -250,7 +253,8 @@ def main():
     ).reset_index(level=1).rename(columns={'level_1': 'Dataset'})
 
     full_results.to_csv('ood_results.csv')
-    print(full_results)
+    print(full_results) """
+    # Save the metrics to a CSV file
 
 if __name__ == '__main__':
     main()
