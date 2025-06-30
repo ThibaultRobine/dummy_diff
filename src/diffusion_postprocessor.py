@@ -1,7 +1,7 @@
 # src/diffusion_postprocessor.py
 
 from typing import Any
-import torch
+import torch, gc
 from openood.postprocessors import BasePostprocessor
 
 import improved_diffusion.dist_util as dist_util
@@ -11,6 +11,12 @@ from algorithm import kmeans_x_ref_list, optimize_reference_point, gaussianQuadr
 from custom_wrapper import create_custom_model_and_diffusion
 from diffusion_model_manager import get_trained_diffusion_model, set_trained_diffusion_model
 
+
+
+def _dbg(tag):
+    torch.cuda.empty_cache(); gc.collect()
+    print(f"[{tag}] alloc={torch.cuda.memory_allocated()/2**20:.0f} MB | "
+          f"reserv={torch.cuda.memory_reserved()/2**20:.0f} MB")
 
 class DiffusionPostprocessor(BasePostprocessor):
     def __init__(self, config):
@@ -41,7 +47,23 @@ class DiffusionPostprocessor(BasePostprocessor):
         net.eval()
         with torch.no_grad():
             _, features = net(images, return_feature=True)
+            print("[DEBUG][SETUP] Initial features - ",
+              f"shape: {features.shape}, ",
+              f"mean: {features.mean().item():.3f}, ",
+              f"std: {features.std().item():.3f}")
         net.train()
+
+        feats_list = []
+        for batch in id_loader_dict['train']:
+            with torch.no_grad():
+                _, feats = net(batch['data'].cuda(), return_feature=True)
+                feats_list.append(feats.cpu())
+        all_feats = torch.cat(feats_list, dim=0).to('cuda')  # [50000, 512]
+        
+        # Normalize using GLOBAL stats
+        self.train_mean = all_feats.mean(dim=0, keepdim=True)  # [1, 512]
+        self.train_std = all_feats.std(dim=0, keepdim=True) + 1e-6
+        all_feats = (all_feats - self.train_mean) / self.train_std
 
         if features.dim() != 2:
             raise RuntimeError(f"Expected penultimate features to be [B, D], got {features.shape}!")
@@ -108,13 +130,13 @@ class DiffusionPostprocessor(BasePostprocessor):
             model.train()
             self.diffusion_model = model
             self.diffusion_obj = diffusion
-
+            _dbg("before TrainLoop")
             train_loop_cfg = self.diffusion_args['train_loop']
             schedule_sampler = create_named_schedule_sampler("uniform", diffusion)
             self.train_loop = TrainLoop(
                 model=model,
                 diffusion=diffusion,
-                data=self._make_feature_generator(net, id_loader_dict['train']),
+                data=self._make_feature_generator(net,id_loader_dict['train']),
                 batch_size=train_loop_cfg['batch_size'],
                 microbatch=train_loop_cfg['microbatch'],
                 lr=train_loop_cfg['lr'],
@@ -129,6 +151,7 @@ class DiffusionPostprocessor(BasePostprocessor):
                 lr_anneal_steps=train_loop_cfg['lr_anneal_steps']
             )
             self.train_loop.run_loop()
+            _dbg("after TrainLoop")
             model.eval()
             set_trained_diffusion_model(model, diffusion)
 
@@ -138,7 +161,11 @@ class DiffusionPostprocessor(BasePostprocessor):
                 imgs = batch_data['data'].cuda()
                 _, feats_b = net(imgs, return_feature=True)
                 feats_list.append(feats_b.cpu())
-        all_id_features = torch.cat(feats_list, dim=0).to('cuda')
+        all_feats = torch.cat(feats_list, dim=0).to('cuda')
+        print("[DEBUG][SETUP] All ID features - ",
+              f"shape: {all_feats.shape}, ",
+              f"mean: {all_feats.mean().item():.3f}, ",
+              f"std: {all_feats.std().item():.3f}")
 
 
         kmeans_k = self.integration_args['kmeans_k']
@@ -155,9 +182,10 @@ class DiffusionPostprocessor(BasePostprocessor):
         asc_conv_thresh = self.integration_args['asc_convergence_threshold']    # e.g. 1e-6
         asc_min_steps = self.integration_args['asc_min_steps']                  # e.g. 100
 
-        init_refs = kmeans_x_ref_list(all_id_features, kmeans_k)
+        init_refs = kmeans_x_ref_list(all_feats, kmeans_k)
         ref_points = optimize_reference_point(
             model=self.diffusion_model,
+            diffusion = self.diffusion_obj,
             initial_x=init_refs,
             num_steps=asc_steps,
             lr=asc_lr,
@@ -176,8 +204,9 @@ class DiffusionPostprocessor(BasePostprocessor):
             for x_ref in ref_points:
                 sc = gaussianQuadrature(
                     model=self.diffusion_model,
-                    x=all_id_features,
-                    x_ref=x_ref,
+                    diffusion = self.diffusion_obj,
+                    x=all_feats,
+                    x_ref=x_ref ,
                     n=gauss_n,
                     device=asc_device,
                     batch_size=gauss_batch
@@ -195,8 +224,13 @@ class DiffusionPostprocessor(BasePostprocessor):
         pred = logits.argmax(dim=1)
 
         _, feats = net(data, return_feature=True)
+        feats = (feats - self.train_mean.to(feats.device)) / self.train_std.to(feats.device)
+        print("[DEBUG][INFER] Test features - ",
+              f"shape: {feats.shape}, ",
+              f"mean: {feats.mean().item():.3f}, ",
+              f"std: {feats.std().item():.3f}")
 
-        int_cfg = self.diffusion_args['integration_method']
+        int_cfg = self.integration_args
         gauss_n = int_cfg['gauss_n']
         gauss_batch = int_cfg['gauss_batch']
         asc_device = int_cfg['device']
@@ -205,6 +239,7 @@ class DiffusionPostprocessor(BasePostprocessor):
         for x_ref in self.x_ref:
             sc = gaussianQuadrature(
                 model=self.diffusion_model,
+                diffusion = self.diffusion_obj,
                 x=feats,
                 x_ref=x_ref,
                 n=gauss_n,
@@ -226,5 +261,7 @@ class DiffusionPostprocessor(BasePostprocessor):
                 images = batch_data['data'].cuda()
                 with torch.no_grad():
                     _, feats = net(images, return_feature=True)
+                    feats = ( feats - self.train_mean) / self.train_std
                     feats = feats.unsqueeze(1)
+                    
                 yield feats, {}

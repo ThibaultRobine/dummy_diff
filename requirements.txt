@@ -1,9 +1,14 @@
+Cython>=0.17
+numpy<2
 torch>=1.13.1
 torchvision>=0.13
 scikit-learn
 opencv-python
-libmr
 mpi4py
 blobfile
 tqdm
+statsmodels<0.15
+faiss-gpu==1.7.2
+libmr
+pytorch-warmup 
 git+https://github.com/Jingkang50/OpenOOD  # Install OpenOOD via pip

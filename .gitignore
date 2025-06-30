@@ -1,4 +1,22 @@
 .venv
 __pycache__
 *.pyc
+# Fichiers dummy_diff_eval-* (.err et .out)
+dummy_diff_eval-*
+
+# Tous les logs
+logs/
+
+# Dossiers volumineux ou non pertinents
+data/
+trained_diffusion_ckpts/
+pretrained_models/
+
+# Répertoires openai-2025...
+openai-2025-*/
+
+# Archives et modèles lourds
+*.zip
+*.pt
+*.pth
 

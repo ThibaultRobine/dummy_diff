@@ -8,6 +8,7 @@ from sklearn.preprocessing import StandardScaler
 
 def optimize_reference_point(
     model,
+    diffusion,
     initial_x,
     num_steps=10000,
     lr=1e-4,
@@ -42,7 +43,11 @@ def optimize_reference_point(
                 if active_x.numel() == 0:
                     break
                 active_x_reshaped = active_x.unsqueeze(1)
-                score_reshaped = model(active_x_reshaped, torch.zeros(active_x.size(0), dtype=torch.long, device=device))
+                t = torch.full((active_x.size(0),), 
+              2,  # Should be 1000
+              dtype=torch.long, 
+              device=device)
+                score_reshaped = model(active_x_reshaped, t)
                 score = score_reshaped.squeeze(1)
                 score_history[step, active_mask] = score.norm(dim=1)
 
@@ -72,13 +77,17 @@ def optimize_reference_point(
 
     return x.detach()
 
-def projected_score(model, t, x, y, device='cuda'):
+def projected_score(model,diffusion, t, x, y, device='cuda'):
     with torch.no_grad():
         z = x * (1 - t) + y * t
         shape = z.shape
         z = z.reshape(-1, z.shape[-1])
         z_reshaped = z.unsqueeze(1)
-        s_reshaped = model(z_reshaped, torch.zeros(z_reshaped.size(0), dtype=torch.long, device=device))
+        t = torch.full((z_reshaped.size(0),), 
+              2,  # Should be 1000
+              dtype=torch.long, 
+              device=device)
+        s_reshaped = model(z_reshaped, t)
         s = s_reshaped.squeeze(1)
         s = s.view(shape)
         return torch.sum(s * (y - x), dim=1)
@@ -99,7 +108,7 @@ def getGaussLegendrePointsAndWeights(n, device='cuda'):
         w = torch.tensor(w_np, dtype=torch.float32, device=device)
     return x, w
 
-def gaussianQuadrature(model, x, x_ref, n, device='cuda', batch_size=5000):
+def gaussianQuadrature(model,diffusion, x, x_ref, n, device='cuda', batch_size=5000):
     p, w = getGaussLegendrePointsAndWeights(n, device=device)
     p = p.view(-1, 1)
     w = w.view(-1, 1)
@@ -114,7 +123,7 @@ def gaussianQuadrature(model, x, x_ref, n, device='cuda', batch_size=5000):
         point_iter = tqdm(range(n), desc="Quadrature Points", leave=False)
         for i in point_iter:
             t_i = 0.5 * (p[i] + 1)
-            sc = projected_score(model, t_i, x_batch, x_ref, device=device)
+            sc = projected_score(model,diffusion, t_i, x_batch, x_ref, device=device)
             batch_result += w[i] * sc
         result[start:end] = -0.5 * batch_result
     return result
