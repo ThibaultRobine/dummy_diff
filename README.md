@@ -6,7 +6,7 @@ The method was benchmarked against state-of-the-art approaches and integrated in
 
 ## Project Status
 
-This work is **unfinished** and was originally intended to evolve into a research publication. Although the experiments and method are functional, and some parts may be incomplete or unrefined.
+This work is **unfinished** and was originally intended to evolve into a research publication. Although the experiments and method are functional, some parts may be incomplete or unrefined.
 
 A draft of the unfinished article can be found here:  
  [`article_UQ.pdf`](./article_UQ.pdf)
@@ -24,3 +24,4 @@ This is a personal research project carried out in collaboration with ISIR. The 
 
 For questions, feel free to contact me at:    
  thibaultrobine68@gmail.com
+
