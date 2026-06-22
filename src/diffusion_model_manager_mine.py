@@ -3,6 +3,7 @@ import torch
 from pathlib import Path
 import datetime as dt
 import dataclasses
+from typing import Optional, Union
 
 _model = None
 _last_ckpt_path = None
@@ -16,7 +17,7 @@ def _timestamp() -> str:
 def _default_ckpt_path() -> Path:
     return CKPT_DIR / f"diffusion_{_timestamp()}.pt"
 
-def set_trained_diffusion_model(model, ckpt_path: str | Path | None = None) -> Path:
+def set_trained_diffusion_model(model, ckpt_path: Optional[Union[str, Path]] = None) -> Path:
     global _model, _last_ckpt_path
     
     # 1. Handle checkpoint path
@@ -39,5 +40,5 @@ def set_trained_diffusion_model(model, ckpt_path: str | Path | None = None) -> P
 def get_trained_diffusion_model():
     return _model
 
-def last_checkpoint_path() -> Path | None:
+def last_checkpoint_path() -> Optional[Path]:
     return _last_ckpt_path

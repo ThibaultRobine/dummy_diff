@@ -11,7 +11,6 @@ from diffusion_nll_postprocessor_mine import DiffusionNllPostprocessor
 from diffusion_model_manager_mine import set_trained_diffusion_model
 from model_unet import DiscreteDDPMProcess, UniformDiscreteTimeSampler, DiffusionModel
 import dataclasses
-import timm
 
 ID_NAME = 'cifar100'
 DATA_ROOT = './data'

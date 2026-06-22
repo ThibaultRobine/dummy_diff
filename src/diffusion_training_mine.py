@@ -2,6 +2,7 @@ import torch
 from torch import optim
 import pytorch_warmup as warmup
 import dataclasses
+from typing import Union
 
 # Project‑local imports ---------------------------------------------------------
 from diffusion_model_manager_mine import (
@@ -25,7 +26,7 @@ class NetConfig:
 def build_or_load_diffusion_model(
     diffusion_args: dict,
     feature_bank: torch.Tensor,
-    device: str | torch.device = "cuda",
+    device: Union[str, torch.device] = "cuda",
 ) -> DiffusionModel:
     """Return a trained ``DiffusionModel`` instance.
 

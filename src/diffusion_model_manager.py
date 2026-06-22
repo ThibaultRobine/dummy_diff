@@ -6,11 +6,12 @@
 from pathlib import Path
 import torch
 import datetime as _dt
+from typing import Optional, Union
 
 # ------------------------------------------------------------------
 # In‑memory cache
 _trained_model = None          # (model, diffusion) tuple
-_last_ckpt_path: Path | None = None
+_last_ckpt_path: Optional[Path] = None
 # ------------------------------------------------------------------
 
 # Directory where checkpoints will be written
@@ -25,7 +26,7 @@ def _default_ckpt_path() -> Path:
     return CKPT_DIR / f"diffusion_{_timestamp()}.pt"
 
 # ------------------------------------------------------------------
-def set_trained_diffusion_model(model, diffusion, ckpt_path: str | Path | None = None):
+def set_trained_diffusion_model(model, diffusion, ckpt_path: Optional[Union[str, Path]] = None):
     """
     Stores the pair (model, diffusion) in RAM **and** serialises the model
     weights to disk.  Returns the checkpoint path.
@@ -76,6 +77,6 @@ def get_trained_diffusion_model():
     """
     return _trained_model
 
-def last_checkpoint_path() -> Path | None:
+def last_checkpoint_path() -> Optional[Path]:
     """Handy helper if you need the filename later."""
     return _last_ckpt_path
